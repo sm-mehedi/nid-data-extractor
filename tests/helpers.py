@@ -51,6 +51,24 @@ def blurry_card_image() -> np.ndarray:
     return cv2.GaussianBlur(image, (35, 35), 15)
 
 
+def whatsapp_compressed_card_image() -> np.ndarray:
+    """Simulates a realistic legible-but-degraded phone photo: mild
+    handheld-focus softness (a 5x5 Gaussian blur — subtle, not the heavy
+    blur used in blurry_card_image) followed by WhatsApp-style downscale +
+    aggressive JPEG re-encode. Measures ~47-52 Laplacian variance, well
+    above BLUR_VARIANCE_THRESHOLD (35) but well below a pristine synthetic
+    image (~1489) — representative of the false positives reported against
+    real WhatsApp-sent NID photos."""
+    image = clear_card_image()
+    softened = cv2.GaussianBlur(image, (5, 5), 0)
+    h, w = softened.shape[:2]
+    small = cv2.resize(softened, (int(w * 0.5), int(h * 0.5)), interpolation=cv2.INTER_AREA)
+    upscaled = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    ok, buf = cv2.imencode(".jpg", upscaled, [cv2.IMWRITE_JPEG_QUALITY, 35])
+    assert ok
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+
 def dark_image() -> np.ndarray:
     image = clear_card_image()
     return (image.astype(np.float32) * 0.08).astype(np.uint8)
