@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bangladesh NID Extractor</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="hero">
+    <h1>Bangladesh NID Extractor</h1>
+    <p>Upload both sides of a Bangladesh National ID card to extract structured, English-translated data.</p>
+  </header>
+
+  <main class="container">
+    <form id="upload-form" onsubmit="return false">
+      <div class="upload-grid">
+        <div class="upload-zone" id="zone-front">
+          <label for="front_image">
+            <div class="card-frame" id="preview-front">
+              <span class="card-placeholder">NID Front</span>
+            </div>
+            <span class="zone-label">Front side</span>
+          </label>
+          <input type="file" id="front_image" name="front_image" accept=".jpg,.jpeg,.png" capture="environment" required />
+        </div>
+
+        <div class="upload-zone" id="zone-back">
+          <label for="back_image">
+            <div class="card-frame" id="preview-back">
+              <span class="card-placeholder">NID Back</span>
+            </div>
+            <span class="zone-label">Back side</span>
+          </label>
+          <input type="file" id="back_image" name="back_image" accept=".jpg,.jpeg,.png" capture="environment" required />
+        </div>
+      </div>
+
+      <button type="submit" id="submit-btn">Extract Information</button>
+    </form>
+
+    <div id="loading" class="loading hidden">
+      <div class="spinner"></div>
+      <p id="loading-text">Uploading images…</p>
+    </div>
+
+    <section id="results" class="results hidden">
+      <h2>Extracted Information</h2>
+      <div id="banner" class="banner hidden"></div>
+      <div id="warnings" class="warnings hidden"></div>
+      <div id="field-rows" class="field-rows"></div>
+
+      <details id="raw-json-details" class="raw-json">
+        <summary>View raw JSON</summary>
+        <pre id="raw-json"></pre>
+      </details>
+    </section>
+
+    <section id="error-panel" class="error-panel hidden">
+      <h2>Extraction Failed</h2>
+      <ul id="error-list"></ul>
+    </section>
+  </main>
+
+  <footer>
+    <p>This system verifies internal consistency (MRZ checksums, front/back cross-check, AI plausibility) only — it does not check against Bangladesh's NID registry or perform forgery/face-match verification.</p>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
