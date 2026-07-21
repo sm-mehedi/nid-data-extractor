@@ -1,327 +1,294 @@
-"""Cheap, local, pre-OCR image validation: format/size, blur, exposure, glare,
-and card-boundary detection with auto-crop + deskew.
+import pytest
 
-Every check here runs before any paid API call. File-level problems
-(wrong extension, corrupt/undecodable, too small/large) and a card cut off
-at the frame edge are hard rejections — free to catch, and unrecoverable
-downstream. Blur, exposure, and glare are soft signals instead: real photos
-(especially recompressed by messaging apps, or glare off a laminated card)
-routinely trip these thresholds while still being perfectly legible to
-Cloud Vision/Gemini, so they're surfaced as warnings rather than blocking
-the request.
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-
-import cv2
-import numpy as np
-
-ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
-
-# ID-1 card aspect ratio (85.6mm x 53.98mm)
-CARD_ASPECT_RATIO = 1.586
-CARD_ASPECT_TOLERANCE = 0.35
-
-# Recalibrated down from 60.0: real phone photos sent through WhatsApp (which
-# re-encodes/downsamples images before upload) measure noticeably lower
-# Laplacian variance than a pristine photo even when still clearly legible.
-# A mildly-soft-but-legible photo (normal handheld focus softness) run
-# through simulated WhatsApp-style compression measures ~47-52; a genuinely
-# heavily-blurred photo measures ~1. 35.0 sits well clear of both, with a
-# wide margin on either side (see tests/test_image_checks.py).
-BLUR_VARIANCE_THRESHOLD = 35.0
-DARK_MEAN_THRESHOLD = 45.0
-OVEREXPOSED_MEAN_THRESHOLD = 225.0
-OVEREXPOSED_WHITE_RATIO_THRESHOLD = 0.6
-
-GLARE_BRIGHTNESS_THRESHOLD = 240
-GLARE_MIN_AREA_RATIO = 0.01
-GLARE_MAX_AREA_RATIO = 0.35
-
-MIN_DIMENSION_PX = 200
-
-FRAME_EDGE_MARGIN_PX = 3
+from app.services import gemini as gemini_module
+from app.services import pipeline, vision_ocr
+from tests.helpers import blurry_card_image, build_td1_mrz, clear_card_image, encode_jpg, glare_image
 
 
-class ImageQualityError(Exception):
-    """Raised when an uploaded image fails a cheap local check.
-
-    `status_code` distinguishes a malformed/rejected upload (400) from
-    "no card-like content found at all" (422), per the build plan's error table.
-    """
-
-    def __init__(self, message: str, status_code: int = 400):
-        super().__init__(message)
-        self.message = message
-        self.status_code = status_code
+FRONT_BYTES = encode_jpg(clear_card_image())
+BACK_BYTES = encode_jpg(clear_card_image())
 
 
-@dataclass
-class QualityCheckResult:
-    image: np.ndarray
-    warnings: list[str] = field(default_factory=list)
-    auto_cropped: bool = False
+def _make_ocr_stub(front_text: str, back_text: str):
+    calls = {"n": 0}
+
+    def _fake_detect_text(image_bytes: bytes):
+        calls["n"] += 1
+        text = front_text if calls["n"] == 1 else back_text
+        return vision_ocr.OcrResult(full_text=text, raw_response={})
+
+    return _fake_detect_text
 
 
-def validate_extension(filename: str) -> str:
-    if "." not in filename:
-        raise ImageQualityError(
-            f"File '{filename}' has no extension; expected one of {sorted(ALLOWED_EXTENSIONS)}."
-        )
-    ext = filename.rsplit(".", 1)[-1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise ImageQualityError(
-            f"Unsupported file extension '.{ext}'; expected one of {sorted(ALLOWED_EXTENSIONS)}."
-        )
-    return ext
-
-
-def validate_size(content: bytes, max_bytes: int) -> None:
-    if len(content) == 0:
-        raise ImageQualityError("Uploaded file is empty (0 bytes).")
-    if len(content) > max_bytes:
-        raise ImageQualityError(
-            f"File exceeds the maximum upload size of {max_bytes // (1024 * 1024)}MB."
-        )
-
-
-def decode_image(content: bytes) -> np.ndarray:
-    arr = np.frombuffer(content, dtype=np.uint8)
-    image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if image is None:
-        raise ImageQualityError(
-            "File could not be decoded as an image (corrupt or not a real image file)."
-        )
-    h, w = image.shape[:2]
-    if h < MIN_DIMENSION_PX or w < MIN_DIMENSION_PX:
-        raise ImageQualityError(
-            f"Image is too small ({w}x{h}px) to reliably read; please retake at a higher resolution."
-        )
-    return image
-
-
-def compute_blur_variance(gray: np.ndarray) -> float:
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-
-def check_blur(gray: np.ndarray) -> str | None:
-    """Soft check: returns a warning message if the photo looks blurry, else
-    None. Deliberately non-fatal — real (especially WhatsApp-compressed)
-    photos vary enough in sharpness that a hard reject here produces false
-    positives on legible photos; Cloud Vision/Gemini can usually still read
-    a photo that trips this."""
-    variance = compute_blur_variance(gray)
-    if variance < BLUR_VARIANCE_THRESHOLD:
-        return "Photo may be blurry — some fields may be less reliable."
-    return None
-
-
-def compute_brightness_stats(gray: np.ndarray) -> tuple[float, float]:
-    mean = float(gray.mean())
-    white_ratio = float(np.mean(gray > 240))
-    return mean, white_ratio
-
-
-def check_exposure(gray: np.ndarray) -> str | None:
-    """Soft check: returns a warning message if the photo looks too dark or
-    overexposed, else None. Non-fatal for the same reason as check_blur."""
-    mean, white_ratio = compute_brightness_stats(gray)
-    if mean < DARK_MEAN_THRESHOLD:
-        return "Photo appears dark — some fields may be less reliable."
-    if mean > OVEREXPOSED_MEAN_THRESHOLD or white_ratio > OVEREXPOSED_WHITE_RATIO_THRESHOLD:
-        return "Photo appears overexposed — some fields may be less reliable."
-    return None
-
-
-def detect_glare(gray: np.ndarray) -> bool:
-    """Localized bright blob (glare), as opposed to uniform overexposure."""
-    _, thresh = cv2.threshold(gray, GLARE_BRIGHTNESS_THRESHOLD, 255, cv2.THRESH_BINARY)
-    total_area = gray.shape[0] * gray.shape[1]
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for c in contours:
-        area_ratio = cv2.contourArea(c) / total_area
-        if GLARE_MIN_AREA_RATIO < area_ratio < GLARE_MAX_AREA_RATIO:
-            return True
-    return False
-
-
-def check_glare(gray: np.ndarray) -> str | None:
-    """Soft check: returns a warning message if glare looks likely, else
-    None. Non-fatal — real laminated cards routinely show some glare as a
-    physical property of the material even when perfectly legible, so a hard
-    reject here produces false positives on otherwise-good photos."""
-    if detect_glare(gray):
-        return "Possible glare detected — some fields may be less reliable."
-    return None
-
-
-def _order_points(pts: np.ndarray) -> np.ndarray:
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-
-def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    rect = _order_points(pts)
-    (tl, tr, br, bl) = rect
-
-    width_a = np.linalg.norm(br - bl)
-    width_b = np.linalg.norm(tr - tl)
-    max_width = max(int(width_a), int(width_b))
-
-    height_a = np.linalg.norm(tr - br)
-    height_b = np.linalg.norm(tl - bl)
-    max_height = max(int(height_a), int(height_b))
-
-    dst = np.array(
-        [[0, 0], [max_width - 1, 0], [max_width - 1, max_height - 1], [0, max_height - 1]],
-        dtype="float32",
+def _base_gemini_result(**overrides) -> gemini_module.GeminiResult:
+    defaults = dict(
+        name="Md. Rahim",
+        fatherName="Abdul Karim",
+        motherName="Amena Begum",
+        dateOfBirth="1998-01-15",
+        nidNumber="987654321",
+        presentAddress="Village Rampur, Upazila Debidwar, District Cumilla",
+        permanentAddress="Village Rampur, Upazila Debidwar, District Cumilla",
+        isNidCard=True,
+        frontQualityNote=None,
+        backQualityNote=None,
+        lowConfidenceFields=[],
     )
-    matrix = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image, matrix, (max_width, max_height))
+    defaults.update(overrides)
+    return gemini_module.GeminiResult(**defaults)
 
 
-@dataclass
-class CardBoundaryResult:
-    found: bool
-    touches_frame_edge: bool = False
-    quad: np.ndarray | None = None
+def test_extract_nid_full_success(monkeypatch):
+    back_text_with_mrz = "NATIONAL ID CARD\n" + build_td1_mrz(doc_number="987654321", dob="980115")
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("front text, no mrz here", back_text_with_mrz),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(),
+    )
+
+    result = pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
+
+    assert result.success is True
+    assert result.errors == []
+    assert result.data.nidNumber == "987654321"
+    assert result.data.dateOfBirth == "1998-01-15"
+    assert result.warnings == []
 
 
-def find_card_quad(gray: np.ndarray) -> CardBoundaryResult:
-    h, w = gray.shape[:2]
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def test_extract_nid_blurry_and_glare_photos_still_succeed_end_to_end(monkeypatch):
+    # End-to-end regression: blur/exposure/glare must never block a request —
+    # a real (if imperfect) front/back pair should still reach Cloud
+    # Vision/Gemini and come back as success:true with descriptive warnings,
+    # not a 400-equivalent hard failure.
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("front text", "back text no mrz"),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(),
+    )
 
-    frame_area = h * w
-    best_quad = None
-    best_area = 0.0
+    blurry_front = encode_jpg(blurry_card_image())
+    glare_back = encode_jpg(glare_image())
 
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < 0.15 * frame_area:
-            continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) != 4:
-            continue
-        pts = approx.reshape(4, 2).astype("float32")
-        rect = _order_points(pts)
-        (tl, tr, br, bl) = rect
-        width = max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl))
-        height = max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl))
-        if height == 0:
-            continue
-        ratio = width / height
-        if ratio < 1:
-            ratio = 1 / ratio
-        if abs(ratio - CARD_ASPECT_RATIO) > CARD_ASPECT_TOLERANCE:
-            continue
-        if area > best_area:
-            best_area = area
-            best_quad = rect
+    result = pipeline.extract_nid(blurry_front, "front.jpg", glare_back, "back.jpg", 10_000_000)
 
-    if best_quad is not None:
-        touches_edge = bool(
-            np.any(best_quad[:, 0] <= FRAME_EDGE_MARGIN_PX)
-            or np.any(best_quad[:, 0] >= w - FRAME_EDGE_MARGIN_PX)
-            or np.any(best_quad[:, 1] <= FRAME_EDGE_MARGIN_PX)
-            or np.any(best_quad[:, 1] >= h - FRAME_EDGE_MARGIN_PX)
-        )
-        return CardBoundaryResult(found=True, touches_frame_edge=touches_edge, quad=best_quad)
-
-    # No fully-closed quad: a card whose physical edge falls outside the photo
-    # has no edge pixels to trace there at all, so Canny-based contour search
-    # can never close a polygon for it. Fall back to a coarser brightness-blob
-    # check: a large, roughly card-shaped region whose bounding box runs into
-    # the frame border is exactly that "cut off" situation.
-    if _cutoff_blob_touches_border(gray):
-        return CardBoundaryResult(found=True, touches_frame_edge=True)
-
-    return CardBoundaryResult(found=False)
+    assert result.success is True
+    assert result.errors == []
+    assert any("blur" in w.lower() for w in result.warnings)
+    assert any("glare" in w.lower() for w in result.warnings)
 
 
-def _cutoff_blob_touches_border(gray: np.ndarray) -> bool:
-    h, w = gray.shape[:2]
-    frame_area = h * w
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+def test_extract_nid_mrz_cross_check_mismatch_warns_but_succeeds(monkeypatch):
+    back_text_with_mrz = "NATIONAL ID CARD\n" + build_td1_mrz(doc_number="111111111", dob="980115")
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("front text", back_text_with_mrz),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(nidNumber="222222222"),
+    )
 
-    for candidate in (thresh, cv2.bitwise_not(thresh)):
-        contours, _ = cv2.findContours(candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < 0.15 * frame_area or area > 0.85 * frame_area:
-                # Too small to be the card, or too large — almost certainly the
-                # background itself (which trivially touches every side).
-                continue
-            x, y, cw, ch = cv2.boundingRect(c)
-            touches_left = x <= FRAME_EDGE_MARGIN_PX
-            touches_top = y <= FRAME_EDGE_MARGIN_PX
-            touches_right = x + cw >= w - FRAME_EDGE_MARGIN_PX
-            touches_bottom = y + ch >= h - FRAME_EDGE_MARGIN_PX
-            num_sides_touched = sum([touches_left, touches_top, touches_right, touches_bottom])
-            # A card cut off by the frame runs off through 1-2 sides, not 3-4 —
-            # 3+ sides touched is a signature of picking up the background blob.
-            if not (1 <= num_sides_touched <= 2):
-                continue
-            ratio = cw / ch if cw > ch else ch / cw
-            if abs(ratio - CARD_ASPECT_RATIO) <= CARD_ASPECT_TOLERANCE:
-                return True
-    return False
+    result = pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
+
+    assert result.success is True
+    assert result.data.nidNumber == "111111111"  # MRZ-verified value wins
+    assert any("Front/back may not match" in w for w in result.warnings)
 
 
-def run_quality_pipeline(content: bytes, filename: str, max_upload_bytes: int) -> QualityCheckResult:
-    """Runs the full cheap-local-checks pipeline (Section 2, step 2 of the build plan).
+def test_extract_nid_not_a_card_raises(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("random text", "more random text"),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(isNidCard=False, name=None, nidNumber=None),
+    )
 
-    Raises ImageQualityError only for hard rejections: bad file (extension,
-    size, undecodable, too small) or a card genuinely cut off at the frame
-    edge (missing data no downstream processing can recover). Blur,
-    exposure, and glare are soft checks — they never block the request, they
-    just add a note to the returned warnings list and let Cloud Vision/Gemini
-    have a shot at the image anyway.
-    """
-    validate_extension(filename)
-    validate_size(content, max_upload_bytes)
-    image = decode_image(content)
+    with pytest.raises(pipeline.NotNidCardError):
+        pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    warnings: list[str] = []
+def test_extract_nid_low_confidence_fields_produce_warnings(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("front text", "back text no mrz"),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(lowConfidenceFields=["fatherName"]),
+    )
 
-    blur_warning = check_blur(gray)
-    if blur_warning:
-        warnings.append(blur_warning)
+    result = pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
 
-    exposure_warning = check_exposure(gray)
-    if exposure_warning:
-        warnings.append(exposure_warning)
+    assert result.success is True
+    assert "Low confidence on field: fatherName" in result.warnings
 
-    glare_warning = check_glare(gray)
-    if glare_warning:
-        warnings.append(glare_warning)
 
-    boundary = find_card_quad(gray)
-    result_image = image
-    auto_cropped = False
+def test_extract_nid_bengali_digits_normalized(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("front text", "back text no mrz"),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(nidNumber="১২৩৪৫৬৭৮৯০১২৩"),
+    )
 
-    if boundary.found and boundary.touches_frame_edge:
-        raise ImageQualityError(
-            "Card appears cut off at the edge of the photo; please retake showing the full card."
-        )
-    elif boundary.found and boundary.quad is not None:
-        result_image = four_point_transform(image, boundary.quad)
-        auto_cropped = True
-    else:
-        warnings.append(
-            "Could not confidently detect the card boundary; falling back to AI visual judgment."
-        )
+    result = pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
 
-    return QualityCheckResult(image=result_image, warnings=warnings, auto_cropped=auto_cropped)
+    assert result.data.nidNumber == "1234567890123"
+
+
+def test_extract_nid_mrz_unparseable_produces_warning(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("front text", "back text with no mrz block at all"),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(),
+    )
+
+    result = pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
+
+    assert result.success is True
+    assert any("machine-readable zone" in w for w in result.warnings)
+
+
+def test_extract_nid_propagates_vision_ocr_error(monkeypatch):
+    def _raise(*a, **kw):
+        raise vision_ocr.VisionOCRError("simulated timeout")
+
+    monkeypatch.setattr("app.services.vision_ocr.detect_text", _raise)
+
+    with pytest.raises(vision_ocr.VisionOCRError):
+        pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
+
+
+def test_extract_nid_propagates_gemini_error(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("front text", "back text"),
+    )
+
+    def _raise(*a, **kw):
+        raise gemini_module.GeminiError("simulated 429")
+
+    monkeypatch.setattr("app.services.gemini.structure_and_translate", _raise)
+
+    with pytest.raises(gemini_module.GeminiError):
+        pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
+
+
+def test_extract_nid_same_image_both_sides_does_not_crash(monkeypatch):
+    # Neither side will contain a real MRZ, since both are the same "front".
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("front text, no mrz", "front text, no mrz"),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(),
+    )
+
+    result = pipeline.extract_nid(FRONT_BYTES, "front.jpg", FRONT_BYTES, "front.jpg", 10_000_000)
+
+    assert result.success is True
+    assert any("machine-readable zone" in w for w in result.warnings)
+
+
+def test_extract_nid_front_back_swapped_does_not_crash(monkeypatch):
+    # Swapping which field the real front/back bytes land in shouldn't matter to
+    # the pipeline — it just processes whatever bytes it's given per side.
+    back_text_with_mrz = "NATIONAL ID CARD\n" + build_td1_mrz(doc_number="555555555", dob="900101")
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub(back_text_with_mrz, "front text, no mrz"),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(),
+    )
+
+    # Here "front_content" is actually back-side bytes/text and vice versa —
+    # simulating the user swapping the two uploads.
+    result = pipeline.extract_nid(BACK_BYTES, "back.jpg", FRONT_BYTES, "front.jpg", 10_000_000)
+    assert result.success is True
+
+
+def test_extract_nid_empty_ocr_text_both_sides_still_succeeds_via_gemini(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("", ""),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(),
+    )
+
+    result = pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
+    assert result.success is True
+    assert any("machine-readable zone" in w for w in result.warnings)
+
+
+def test_extract_nid_one_side_unreadable_produces_side_specific_warning(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("front text", "back text no mrz"),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(
+            backQualityNote="obscured by glare, several fields illegible",
+            motherName=None,
+        ),
+    )
+
+    result = pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
+
+    assert result.success is True
+    assert any("Back: obscured by glare" in w for w in result.warnings)
+    assert not any(w.startswith("Front:") for w in result.warnings)
+    assert result.data.motherName is None
+
+
+def test_extract_nid_long_multiline_address_preserved(monkeypatch):
+    long_address = (
+        "House 12, Road 5, Block C, Section 2, Mirpur, Dhaka-1216, "
+        "near Central Mosque, opposite Green View School, Bangladesh"
+    )
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("front text", "back text no mrz"),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(presentAddress=long_address, permanentAddress=long_address),
+    )
+
+    result = pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
+
+    assert result.data.presentAddress == long_address
+    assert result.data.permanentAddress == long_address
+
+
+def test_extract_nid_name_with_honorifics_passed_through(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.vision_ocr.detect_text",
+        _make_ocr_stub("front text", "back text no mrz"),
+    )
+    monkeypatch.setattr(
+        "app.services.gemini.structure_and_translate",
+        lambda *a, **kw: _base_gemini_result(name="Md. Rahim", fatherName="Mst. Amena Begum"),
+    )
+
+    result = pipeline.extract_nid(FRONT_BYTES, "front.jpg", BACK_BYTES, "back.jpg", 10_000_000)
+    assert result.data.name == "Md. Rahim"
+    assert result.data.fatherName == "Mst. Amena Begum"
