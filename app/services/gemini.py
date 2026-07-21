@@ -5,15 +5,20 @@ here is different: understand *meaning* well enough to translate
 name/parent-name/address fields without doing literal word-for-word
 substitution, and make the holistic "does this look like a real NID" call
 that a pure OCR+regex pipeline can't.
+
+Uses the `google-genai` SDK (the legacy `google-generativeai` package has no
+`thinking_config` support at all, in any version, and is fully deprecated).
 """
 from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import google.generativeai as genai
+from google import genai
+from google.genai import errors, types
 
 from app.config import get_settings
 
@@ -131,6 +136,74 @@ def parse_gemini_response(text: str) -> GeminiResult:
     )
 
 
+def _is_rate_limited(exc: Exception) -> bool:
+    if isinstance(exc, errors.ClientError) and getattr(exc, "code", None) == 429:
+        return True
+    message = str(exc).lower()
+    return "429" in message or "rate" in message or "quota" in message
+
+
+def _is_timeout(exc: Exception) -> bool:
+    if isinstance(exc, errors.ServerError) and getattr(exc, "code", None) == 504:
+        return True
+    # httpx timeout exceptions (a true client-side timeout, no response from
+    # the server at all) often carry an empty message — the class name
+    # ("ReadTimeout", "ConnectTimeout", ...) is the reliable signal there.
+    if "timeout" in type(exc).__name__.lower():
+        return True
+    message = str(exc).lower()
+    return "timeout" in message or "deadline" in message
+
+
+def _classify_error(exc: Exception) -> GeminiError:
+    if _is_rate_limited(exc):
+        return GeminiError(f"Gemini rate limit/quota exceeded: {exc}")
+    if _is_timeout(exc):
+        return GeminiError(f"Gemini request timed out: {exc}")
+    return GeminiError(f"Gemini request failed: {exc}")
+
+
+def _generate_with_retry(
+    client: "genai.Client",
+    model: str,
+    contents: list,
+    config: types.GenerateContentConfig,
+    max_retries: int,
+    backoff_seconds: float,
+):
+    """Retries only on 429 (rate limit) and timeout/504 (deadline exceeded) —
+    the two failure modes actually worth a second attempt. Anything else
+    (auth failure, bad request, safety block) fails immediately since a
+    retry wouldn't change the outcome."""
+    attempt = 0
+    while True:
+        try:
+            return client.models.generate_content(model=model, contents=contents, config=config)
+        except Exception as exc:
+            if (not _is_rate_limited(exc) and not _is_timeout(exc)) or attempt >= max_retries:
+                raise
+            time.sleep(backoff_seconds * (attempt + 1))
+            attempt += 1
+
+
+def _build_config(
+    http_options: types.HttpOptions, *, with_thinking: bool
+) -> types.GenerateContentConfig:
+    if with_thinking:
+        # This is structured extraction + translation, not a task that
+        # benefits from extended reasoning — a zero thinking budget cuts
+        # both latency and cost for thinking-capable models.
+        return types.GenerateContentConfig(
+            response_mime_type="application/json",
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            http_options=http_options,
+        )
+    return types.GenerateContentConfig(
+        response_mime_type="application/json",
+        http_options=http_options,
+    )
+
+
 def structure_and_translate(
     front_image_bytes: bytes,
     back_image_bytes: bytes,
@@ -141,31 +214,50 @@ def structure_and_translate(
     if not settings.gemini_api_key:
         raise GeminiError("No Gemini API key configured.")
 
-    genai.configure(api_key=settings.gemini_api_key)
-    model = genai.GenerativeModel(settings.gemini_model)
+    client = genai.Client(api_key=settings.gemini_api_key)
 
     prompt = PROMPT_TEMPLATE.format(
         front_hint=front_ocr_hint or "(no text detected)",
         back_hint=back_ocr_hint or "(no text detected)",
     )
 
+    contents = [
+        prompt,
+        types.Part.from_bytes(data=front_image_bytes, mime_type="image/jpeg"),
+        types.Part.from_bytes(data=back_image_bytes, mime_type="image/jpeg"),
+    ]
+
+    # google-genai's HttpOptions.timeout is in milliseconds.
+    http_options = types.HttpOptions(timeout=settings.gemini_timeout_seconds * 1000)
+
     try:
-        response = model.generate_content(
-            [
-                prompt,
-                {"mime_type": "image/jpeg", "data": front_image_bytes},
-                {"mime_type": "image/jpeg", "data": back_image_bytes},
-            ],
-            generation_config={"response_mime_type": "application/json"},
-            request_options={"timeout": 30},
+        response = _generate_with_retry(
+            client,
+            settings.gemini_model,
+            contents,
+            _build_config(http_options, with_thinking=True),
+            settings.gemini_max_retries,
+            settings.gemini_retry_backoff_seconds,
         )
+    except errors.ClientError as exc:
+        if getattr(exc, "code", None) == 400 and "thinking" in str(exc).lower():
+            # This model doesn't support thinking_config at all — retry once
+            # without it rather than hard-failing the whole request.
+            try:
+                response = _generate_with_retry(
+                    client,
+                    settings.gemini_model,
+                    contents,
+                    _build_config(http_options, with_thinking=False),
+                    settings.gemini_max_retries,
+                    settings.gemini_retry_backoff_seconds,
+                )
+            except Exception as exc2:
+                raise _classify_error(exc2) from exc2
+        else:
+            raise _classify_error(exc) from exc
     except Exception as exc:
-        message = str(exc)
-        if "429" in message or "rate" in message.lower() or "quota" in message.lower():
-            raise GeminiError(f"Gemini rate limit/quota exceeded: {exc}") from exc
-        if "timeout" in message.lower() or "deadline" in message.lower():
-            raise GeminiError(f"Gemini request timed out: {exc}") from exc
-        raise GeminiError(f"Gemini request failed: {exc}") from exc
+        raise _classify_error(exc) from exc
 
     if not response.candidates:
         raise GeminiError("Gemini returned no candidates (likely blocked by safety filters).")
