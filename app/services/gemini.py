@@ -143,6 +143,17 @@ def _is_rate_limited(exc: Exception) -> bool:
     return "429" in message or "rate" in message or "quota" in message
 
 
+def _is_overloaded(exc: Exception) -> bool:
+    """503 UNAVAILABLE — the model is temporarily over capacity. Distinct
+    from both 429 (caller is rate-limited) and 504 (deadline exceeded); this
+    was previously not classified as retryable at all, so a single 503 fell
+    straight through to a hard failure instead of retrying."""
+    if isinstance(exc, errors.ServerError) and getattr(exc, "code", None) == 503:
+        return True
+    message = str(exc).lower()
+    return "503" in message or "unavailable" in message
+
+
 def _is_timeout(exc: Exception) -> bool:
     if isinstance(exc, errors.ServerError) and getattr(exc, "code", None) == 504:
         return True
@@ -155,12 +166,24 @@ def _is_timeout(exc: Exception) -> bool:
     return "timeout" in message or "deadline" in message
 
 
+def _is_retryable(exc: Exception) -> bool:
+    return _is_rate_limited(exc) or _is_overloaded(exc) or _is_timeout(exc)
+
+
 def _classify_error(exc: Exception) -> GeminiError:
     if _is_rate_limited(exc):
         return GeminiError(f"Gemini rate limit/quota exceeded: {exc}")
+    if _is_overloaded(exc):
+        return GeminiError(f"Gemini model overloaded (503): {exc}")
     if _is_timeout(exc):
         return GeminiError(f"Gemini request timed out: {exc}")
     return GeminiError(f"Gemini request failed: {exc}")
+
+
+def _default_fallback_model(model: str) -> str:
+    if not model or model.endswith("-lite"):
+        return ""
+    return f"{model}-lite"
 
 
 def _generate_with_retry(
@@ -168,21 +191,23 @@ def _generate_with_retry(
     model: str,
     contents: list,
     config: types.GenerateContentConfig,
-    max_retries: int,
-    backoff_seconds: float,
+    backoff_schedule: list[float],
 ):
-    """Retries only on 429 (rate limit) and timeout/504 (deadline exceeded) —
-    the two failure modes actually worth a second attempt. Anything else
-    (auth failure, bad request, safety block) fails immediately since a
-    retry wouldn't change the outcome."""
+    """Retries on 429 (rate limit), 503 (overloaded), and timeout/504
+    (deadline exceeded) — failure modes actually worth a second attempt.
+    Anything else (auth failure, bad request, safety block) fails
+    immediately since a retry wouldn't change the outcome.
+
+    `backoff_schedule` is a list of seconds to wait before each successive
+    retry, e.g. [3, 8, 15] = up to 3 retries (4 total attempts)."""
     attempt = 0
     while True:
         try:
             return client.models.generate_content(model=model, contents=contents, config=config)
         except Exception as exc:
-            if (not _is_rate_limited(exc) and not _is_timeout(exc)) or attempt >= max_retries:
+            if not _is_retryable(exc) or attempt >= len(backoff_schedule):
                 raise
-            time.sleep(backoff_seconds * (attempt + 1))
+            time.sleep(backoff_schedule[attempt])
             attempt += 1
 
 
@@ -202,6 +227,28 @@ def _build_config(
         response_mime_type="application/json",
         http_options=http_options,
     )
+
+
+def _attempt_model(
+    client: "genai.Client",
+    model: str,
+    contents: list,
+    http_options: types.HttpOptions,
+    backoff_schedule: list[float],
+):
+    """Runs generate_content against `model` with the given retry schedule.
+    Falls back to a no-thinking config (once, same retry schedule) if the
+    model rejects thinking_config outright rather than hard-failing."""
+    try:
+        return _generate_with_retry(
+            client, model, contents, _build_config(http_options, with_thinking=True), backoff_schedule
+        )
+    except errors.ClientError as exc:
+        if getattr(exc, "code", None) == 400 and "thinking" in str(exc).lower():
+            return _generate_with_retry(
+                client, model, contents, _build_config(http_options, with_thinking=False), backoff_schedule
+            )
+        raise
 
 
 def structure_and_translate(
@@ -229,35 +276,25 @@ def structure_and_translate(
 
     # google-genai's HttpOptions.timeout is in milliseconds.
     http_options = types.HttpOptions(timeout=settings.gemini_timeout_seconds * 1000)
+    backoff_schedule = settings.gemini_retry_backoff_schedule
 
     try:
-        response = _generate_with_retry(
-            client,
-            settings.gemini_model,
-            contents,
-            _build_config(http_options, with_thinking=True),
-            settings.gemini_max_retries,
-            settings.gemini_retry_backoff_seconds,
-        )
-    except errors.ClientError as exc:
-        if getattr(exc, "code", None) == 400 and "thinking" in str(exc).lower():
-            # This model doesn't support thinking_config at all — retry once
-            # without it rather than hard-failing the whole request.
+        response = _attempt_model(client, settings.gemini_model, contents, http_options, backoff_schedule)
+    except Exception as primary_exc:
+        fallback_model = settings.gemini_fallback_model or _default_fallback_model(settings.gemini_model)
+        if fallback_model and _is_overloaded(primary_exc):
+            # Different model variants often have separate capacity pools —
+            # one extra attempt, no retries on the fallback itself.
             try:
-                response = _generate_with_retry(
-                    client,
-                    settings.gemini_model,
-                    contents,
-                    _build_config(http_options, with_thinking=False),
-                    settings.gemini_max_retries,
-                    settings.gemini_retry_backoff_seconds,
-                )
-            except Exception as exc2:
-                raise _classify_error(exc2) from exc2
+                response = _attempt_model(client, fallback_model, contents, http_options, [])
+            except Exception as fallback_exc:
+                raise GeminiError(
+                    f"Gemini request failed on both '{settings.gemini_model}' (after "
+                    f"{len(backoff_schedule)} retries, 503 overloaded) and fallback "
+                    f"'{fallback_model}': {fallback_exc}"
+                ) from fallback_exc
         else:
-            raise _classify_error(exc) from exc
-    except Exception as exc:
-        raise _classify_error(exc) from exc
+            raise _classify_error(primary_exc) from primary_exc
 
     if not response.candidates:
         raise GeminiError("Gemini returned no candidates (likely blocked by safety filters).")
