@@ -78,22 +78,26 @@ def test_blur_check_passes_on_clear_image():
 
     img = clear_card_image()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    image_checks.check_blur(gray)  # should not raise
+    assert image_checks.check_blur(gray) is None
 
 
-def test_blur_check_rejects_blurry_image():
+def test_blur_check_warns_on_blurry_image_but_does_not_raise():
+    # Blur is a soft check: a blurry photo gets a warning, not a hard reject —
+    # Cloud Vision/Gemini still get a shot at it.
     import cv2
 
     img = blurry_card_image()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    with pytest.raises(image_checks.ImageQualityError, match="blurry"):
-        image_checks.check_blur(gray)
+    warning = image_checks.check_blur(gray)
+    assert warning is not None
+    assert "blur" in warning.lower()
 
 
-def test_blur_check_rejects_blurry_image_with_wide_margin_below_threshold():
-    # Guards the recalibration: a genuinely blurry photo must fail by a large
-    # margin, not just barely — confirms lowering the threshold to fix real
-    # WhatsApp-compression false positives didn't quietly let real blur through.
+def test_blurry_image_variance_is_well_below_threshold():
+    # Guards the recalibration: a genuinely blurry photo must measure far
+    # below the threshold, not just barely under it — confirms lowering the
+    # threshold to fix real WhatsApp-compression false positives didn't
+    # quietly let real blur through.
     import cv2
 
     img = blurry_card_image()
@@ -105,33 +109,36 @@ def test_blur_check_rejects_blurry_image_with_wide_margin_below_threshold():
 def test_blur_check_passes_on_whatsapp_compressed_but_legible_photo():
     # Regression test for a real false positive: a real phone photo with
     # normal handheld focus softness, after WhatsApp-style downscale +
-    # aggressive JPEG re-compression, must still pass — it's legible to a
-    # human (and to Cloud Vision/Gemini), just not pixel-perfect sharp.
+    # aggressive JPEG re-compression, must still pass with no warning at all —
+    # it's legible to a human (and to Cloud Vision/Gemini), just not
+    # pixel-perfect sharp.
     import cv2
 
     img = whatsapp_compressed_card_image()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    image_checks.check_blur(gray)  # should not raise
+    assert image_checks.check_blur(gray) is None
     variance = image_checks.compute_blur_variance(gray)
     assert variance > image_checks.BLUR_VARIANCE_THRESHOLD
 
 
-def test_exposure_check_rejects_dark_image():
+def test_exposure_check_warns_on_dark_image_but_does_not_raise():
     import cv2
 
     img = dark_image()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    with pytest.raises(image_checks.ImageQualityError, match="dark"):
-        image_checks.check_exposure(gray)
+    warning = image_checks.check_exposure(gray)
+    assert warning is not None
+    assert "dark" in warning.lower()
 
 
-def test_exposure_check_rejects_overexposed_image():
+def test_exposure_check_warns_on_overexposed_image_but_does_not_raise():
     import cv2
 
     img = overexposed_image()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    with pytest.raises(image_checks.ImageQualityError, match="overexposed"):
-        image_checks.check_exposure(gray)
+    warning = image_checks.check_exposure(gray)
+    assert warning is not None
+    assert "overexposed" in warning.lower()
 
 
 def test_exposure_check_passes_on_clear_image():
@@ -139,16 +146,19 @@ def test_exposure_check_passes_on_clear_image():
 
     img = clear_card_image()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    image_checks.check_exposure(gray)  # should not raise
+    assert image_checks.check_exposure(gray) is None
 
 
-def test_glare_check_detects_localized_bright_blob():
+def test_glare_check_warns_on_localized_bright_blob_but_does_not_raise():
+    # Glare is a soft check: real laminated cards routinely show some glare
+    # as a physical property of the material, even when perfectly legible.
     import cv2
 
     img = glare_image()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    with pytest.raises(image_checks.ImageQualityError, match="Glare"):
-        image_checks.check_glare(gray)
+    warning = image_checks.check_glare(gray)
+    assert warning is not None
+    assert "glare" in warning.lower()
 
 
 def test_glare_check_passes_on_clear_image():
@@ -156,7 +166,7 @@ def test_glare_check_passes_on_clear_image():
 
     img = clear_card_image()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    image_checks.check_glare(gray)  # should not raise
+    assert image_checks.check_glare(gray) is None
 
 
 def test_card_boundary_found_and_cropped():
@@ -204,6 +214,30 @@ def test_run_quality_pipeline_accepts_whatsapp_compressed_photo():
     # goes through, not just the isolated check_blur() unit.
     result = image_checks.run_quality_pipeline(content, "front.jpg", max_upload_bytes=10_000_000)
     assert result is not None
+
+
+def test_run_quality_pipeline_blurry_photo_succeeds_with_warning():
+    content = encode_jpg(blurry_card_image())
+    result = image_checks.run_quality_pipeline(content, "front.jpg", max_upload_bytes=10_000_000)
+    assert any("blur" in w.lower() for w in result.warnings)
+
+
+def test_run_quality_pipeline_dark_photo_succeeds_with_warning():
+    content = encode_jpg(dark_image())
+    result = image_checks.run_quality_pipeline(content, "front.jpg", max_upload_bytes=10_000_000)
+    assert any("dark" in w.lower() for w in result.warnings)
+
+
+def test_run_quality_pipeline_overexposed_photo_succeeds_with_warning():
+    content = encode_jpg(overexposed_image())
+    result = image_checks.run_quality_pipeline(content, "front.jpg", max_upload_bytes=10_000_000)
+    assert any("overexposed" in w.lower() for w in result.warnings)
+
+
+def test_run_quality_pipeline_glare_photo_succeeds_with_warning():
+    content = encode_jpg(glare_image())
+    result = image_checks.run_quality_pipeline(content, "front.jpg", max_upload_bytes=10_000_000)
+    assert any("glare" in w.lower() for w in result.warnings)
 
 
 def test_run_quality_pipeline_cut_off_raises_400():
