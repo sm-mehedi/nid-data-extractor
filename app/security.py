@@ -37,7 +37,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+            "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
             "script-src 'self'"
         )
         return response
