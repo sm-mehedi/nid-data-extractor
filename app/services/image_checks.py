@@ -17,7 +17,14 @@ ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
 CARD_ASPECT_RATIO = 1.586
 CARD_ASPECT_TOLERANCE = 0.35
 
-BLUR_VARIANCE_THRESHOLD = 60.0
+# Recalibrated down from 60.0: real phone photos sent through WhatsApp (which
+# re-encodes/downsamples images before upload) measure noticeably lower
+# Laplacian variance than a pristine photo even when still clearly legible.
+# A mildly-soft-but-legible photo (normal handheld focus softness) run
+# through simulated WhatsApp-style compression measures ~47-52; a genuinely
+# heavily-blurred photo measures ~1. 35.0 sits well clear of both, with a
+# wide margin on either side (see tests/test_image_checks.py).
+BLUR_VARIANCE_THRESHOLD = 35.0
 DARK_MEAN_THRESHOLD = 45.0
 OVEREXPOSED_MEAN_THRESHOLD = 225.0
 OVEREXPOSED_WHITE_RATIO_THRESHOLD = 0.6
