@@ -14,6 +14,7 @@ from tests.helpers import (
     rotated,
     small_unzoomed_card_image,
     tiny_image,
+    whatsapp_compressed_card_image,
 )
 
 
@@ -87,6 +88,32 @@ def test_blur_check_rejects_blurry_image():
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     with pytest.raises(image_checks.ImageQualityError, match="blurry"):
         image_checks.check_blur(gray)
+
+
+def test_blur_check_rejects_blurry_image_with_wide_margin_below_threshold():
+    # Guards the recalibration: a genuinely blurry photo must fail by a large
+    # margin, not just barely — confirms lowering the threshold to fix real
+    # WhatsApp-compression false positives didn't quietly let real blur through.
+    import cv2
+
+    img = blurry_card_image()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    variance = image_checks.compute_blur_variance(gray)
+    assert variance < image_checks.BLUR_VARIANCE_THRESHOLD / 5
+
+
+def test_blur_check_passes_on_whatsapp_compressed_but_legible_photo():
+    # Regression test for a real false positive: a real phone photo with
+    # normal handheld focus softness, after WhatsApp-style downscale +
+    # aggressive JPEG re-compression, must still pass — it's legible to a
+    # human (and to Cloud Vision/Gemini), just not pixel-perfect sharp.
+    import cv2
+
+    img = whatsapp_compressed_card_image()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    image_checks.check_blur(gray)  # should not raise
+    variance = image_checks.compute_blur_variance(gray)
+    assert variance > image_checks.BLUR_VARIANCE_THRESHOLD
 
 
 def test_exposure_check_rejects_dark_image():
@@ -168,6 +195,15 @@ def test_run_quality_pipeline_full_success_autocrops():
     result = image_checks.run_quality_pipeline(content, "front.jpg", max_upload_bytes=10_000_000)
     assert result.auto_cropped is True
     assert result.warnings == []
+
+
+def test_run_quality_pipeline_accepts_whatsapp_compressed_photo():
+    content = encode_jpg(whatsapp_compressed_card_image())
+    # Must not raise "photo appears blurry" for a realistically-compressed
+    # but legible photo — this is the exact end-to-end path a real upload
+    # goes through, not just the isolated check_blur() unit.
+    result = image_checks.run_quality_pipeline(content, "front.jpg", max_upload_bytes=10_000_000)
+    assert result is not None
 
 
 def test_run_quality_pipeline_cut_off_raises_400():
