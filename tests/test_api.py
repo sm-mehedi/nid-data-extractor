@@ -214,3 +214,18 @@ def test_security_headers_present(client):
     assert resp.headers.get("x-content-type-options") == "nosniff"
     assert resp.headers.get("x-frame-options") == "DENY"
     assert "content-security-policy" in resp.headers
+
+
+def test_csp_allows_blob_images_for_upload_previews(client):
+    # The frontend renders file-input previews via URL.createObjectURL(file),
+    # which produces a blob: URL. If img-src doesn't allow blob:, the browser
+    # silently blocks the <img> load and shows a broken-image icon instead of
+    # the selected photo — a real bug that CSP-string assertions like the one
+    # above would not have caught.
+    resp = client.get("/health")
+    csp = resp.headers.get("content-security-policy", "")
+    img_src_directive = next(
+        (part.strip() for part in csp.split(";") if part.strip().startswith("img-src")),
+        "",
+    )
+    assert "blob:" in img_src_directive
