@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     google_application_credentials: str = ""
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
+    gemini_timeout_seconds: int = 100
+    gemini_max_retries: int = 1
+    gemini_retry_backoff_seconds: float = 2.0
 
     max_upload_mb: int = 10
     rate_limit_per_minute: int = 8
