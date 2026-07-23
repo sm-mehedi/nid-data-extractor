@@ -77,9 +77,9 @@ curl -X POST http://localhost:8000/api/v1/nid/extract \
 |---|---|---|
 | Missing `front_image` and/or `back_image` | 400 | false |
 | Wrong extension / corrupt / empty / oversized file | 400 | false |
-| Too blurry / too dark / overexposed / glare over the card | 400 | false |
 | Card cropped/cut off at the edge of the original photo | 400 | false |
 | No card-like content found at all (per AI judgment) | 422 | false |
+| Blurry / dark / overexposed / glare on the card | 200 | true (warning, best-effort data still returned) |
 | Front/back MRZ cross-check mismatch | 200 | true (warning, best-effort data still returned) |
 | Some fields unreadable, others fine | 200 | true (warnings list which fields) |
 | Cloud Vision or Gemini error/timeout/rate-limit | 503 | false |
@@ -87,13 +87,31 @@ curl -X POST http://localhost:8000/api/v1/nid/extract \
 | Per-IP rate limit exceeded | 429 | false |
 | Unexpected server error | 500 | false |
 
+Blur, exposure, and glare are deliberately **soft** checks, not hard
+rejections: real photos (especially recompressed by messaging apps, or a
+laminated card catching some glare) routinely trip these thresholds while
+still being perfectly legible to Cloud Vision/Gemini, so the request
+proceeds anyway and a descriptive note is added to `warnings` instead of
+blocking it. A cut-off card is different in kind — it's genuinely missing
+data no downstream processing can recover — so that one still hard-rejects.
+
 **Example — validation failure (400)**
 ```json
 {
   "success": false,
   "data": null,
   "warnings": [],
-  "errors": ["Photo appears blurry, please retake."]
+  "errors": ["Card appears cut off at the edge of the photo; please retake showing the full card."]
+}
+```
+
+**Example — blurry but legible photo (200, warning only)**
+```json
+{
+  "success": true,
+  "data": { "...": "..." },
+  "warnings": ["Photo may be blurry — some fields may be less reliable."],
+  "errors": []
 }
 ```
 
@@ -113,6 +131,26 @@ curl -X POST http://localhost:8000/api/v1/nid/extract \
   "success": true,
   "data": { "...": "..." },
   "warnings": ["Front/back may not match: NID number from Gemini differs from the MRZ-verified document number."],
+  "errors": []
+}
+```
+
+**Example — a name field needed the local transliteration fallback (200, warning only)**
+```json
+{
+  "success": true,
+  "data": { "fatherName": "Avdula Karima", "...": "..." },
+  "warnings": ["fatherName was not translated by the AI model; applied a local phonetic transliteration fallback (approximate, not a full translation)."],
+  "errors": []
+}
+```
+
+**Example — one address field needed mirroring (200, warning only)**
+```json
+{
+  "success": true,
+  "data": { "presentAddress": "Dhaka, Bangladesh", "permanentAddress": "Dhaka, Bangladesh", "...": "..." },
+  "warnings": ["presentAddress was empty; mirrored from permanentAddress (this card prints a single address for both fields)."],
   "errors": []
 }
 ```
